@@ -32,7 +32,16 @@ curl http://localhost:18266/api/health
 - 纤维配比。原生浆、再生浆、损纸、含水率、灰分和工艺窗校验。
 - 机台工况。机速、定量、烘缸温度、蒸汽压力、安全周产能。
 - 产量配额。RandomForestRegressor 预测均值和 10%/90% 分位数带，跨安全上限时拆成两周。
+- 降额复批。纸机下调安全产能后原配额立即暂停领料，worker 按新工况重算产量，主管复批后才恢复。
 - 领料计划。只允许在已批准配额内累计请求物料。
+
+## 降额与复批规则
+
+- 在配额页面录入降额（新安全产能必须低于当前上限），配额状态转为 `reduced_pending`，新领料请求和领料审批立即暂停。
+- 已经批准的领料照常办理；重算后的新额度若盖不住这部分已批准吨位，主管不能复批（接口返回 `REAPPROVE_SHORT_OF_APPROVED`）。
+- 降额与领料审批并发时靠配额行锁定序：先批准的计入已占吨位，先降额的让审批返回 `ISSUE_APPROVAL_PAUSED`。
+- 重算结果携带降额序号，乱序返回时只认最近一次降额，旧结果标记 `superseded`；同一重算重试执行是幂等空操作，不会重复占用吨位。
+- 配额页面可查看待复批原因、已批准占用吨位和复批后还能领多少。
 
 ## 算法口径
 
@@ -42,7 +51,8 @@ worker 使用固定随机种子 42 生成 160 条带噪合成训练样本，特�
 
 - 角色 `operator/supervisor/viewer`：`backend/src/schema.sql`、`backend/src/auth.py`、`backend/src/main.py`、`frontend/src/app.js`。
 - 批次状态 `registered/measured/forecasted/allocated/blocked`：`backend/src/schema.sql`、`backend/src/main.py`、`frontend/src/app.js`。
-- 配额状态 `queued/ready/split_required/approved/rejected`：`backend/src/schema.sql`、`backend/src/main.py`、`frontend/src/app.js`。
+- 配额状态 `queued/ready/split_required/approved/rejected/reduced_pending`：`backend/src/schema.sql`、`backend/src/main.py`、`frontend/src/app.js`。
+- 降额状态 `recalculating/applied/superseded`：`backend/src/schema.sql`、`backend/src/worker.py`。
 - 领料状态 `requested/approved/issued/rejected`：`backend/src/schema.sql`、`backend/src/main.py`、`frontend/src/app.js`。
 
 ## 目录与技术栈

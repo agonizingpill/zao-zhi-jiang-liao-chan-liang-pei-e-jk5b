@@ -56,3 +56,13 @@ def seed():
         q = query("SELECT id FROM quota_plans WHERE plan_code='QP-2611-001'", one=True)["id"]
         execute("""INSERT INTO material_issues(issue_code,quota_plan_id,material_name,quantity_tons,status,requested_by,approved_by,issued_at)
           VALUES ('MI-2611-001',%s,'漂白木浆',24,'approved',%s,%s,now())""", (q, operator, supervisor))
+    if not query("SELECT id FROM quota_plans WHERE plan_code='QP-2611-003'", one=True):
+        plan_id = query("""INSERT INTO quota_plans(plan_code,pulp_lot_id,machine_run_id,week_start,predicted_tons,lower_tons,upper_tons,safety_limit_tons,planned_tons,split_required,status,created_by,approved_by,approved_at,notes,reduction_seq)
+          VALUES ('QP-2611-003',%s,%s,%s,63.5,60.1,66.9,70,63.5,false,'reduced_pending',%s,%s,now(),'机台安全产能下调 86→70 t：PM-07 烘缸轴承振动超阈，安全产能下调',1) RETURNING id""",
+          (lots[3], m1, date(2026,11,23), operator, supervisor), one=True)["id"]
+        reduction_id = query("""INSERT INTO capacity_reductions(reduction_code,quota_plan_id,machine_run_id,old_safety_limit_tons,new_safety_limit_tons,reason,status,created_by)
+          VALUES ('QR-QP-2611-003-01',%s,%s,86,70,'PM-07 烘缸轴承振动超阈，安全产能下调','applied',%s) RETURNING id""",
+          (plan_id, m1, supervisor), one=True)["id"]
+        execute("UPDATE quota_plans SET current_reduction_id=%s, applied_reduction_id=%s WHERE id=%s", (reduction_id, reduction_id, plan_id))
+        execute("""INSERT INTO material_issues(issue_code,quota_plan_id,material_name,quantity_tons,status,requested_by,approved_by)
+          VALUES ('MI-2611-002',%s,'漂白木浆',20,'approved',%s,%s)""", (plan_id, operator, supervisor))

@@ -29,6 +29,20 @@ def execute(sql, params=()):
             cur.execute(sql, params)
             return cur.rowcount
 
+@contextmanager
+def transaction():
+    """多语句事务：yield 一个 RealDictCursor，块内异常回滚，正常结束提交。"""
+    conn = psycopg2.connect(DATABASE_URL)
+    try:
+        with conn.cursor(cursor_factory=RealDictCursor) as cur:
+            yield cur
+        conn.commit()
+    except Exception:
+        conn.rollback()
+        raise
+    finally:
+        conn.close()
+
 def wait_for_db():
     for _ in range(40):
         try:

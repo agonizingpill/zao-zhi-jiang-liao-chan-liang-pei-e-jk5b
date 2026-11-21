@@ -57,7 +57,7 @@ CREATE TABLE IF NOT EXISTS quota_plans (
   planned_tons NUMERIC(10,2),
   split_required BOOLEAN NOT NULL DEFAULT false,
   split_weeks INTEGER NOT NULL DEFAULT 1,
-  status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','ready','split_required','approved','rejected')),
+  status TEXT NOT NULL DEFAULT 'queued' CHECK (status IN ('queued','ready','split_required','approved','rejected','reduced_pending')),
   created_by INTEGER NOT NULL REFERENCES users(id),
   approved_by INTEGER REFERENCES users(id),
   approved_at TIMESTAMPTZ,
@@ -76,6 +76,18 @@ CREATE TABLE IF NOT EXISTS material_issues (
   issued_at TIMESTAMPTZ,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+CREATE TABLE IF NOT EXISTS capacity_reductions (
+  id SERIAL PRIMARY KEY,
+  reduction_code TEXT UNIQUE NOT NULL,
+  quota_plan_id INTEGER NOT NULL REFERENCES quota_plans(id),
+  machine_run_id INTEGER NOT NULL REFERENCES machine_runs(id),
+  old_safety_limit_tons NUMERIC(10,2) NOT NULL,
+  new_safety_limit_tons NUMERIC(10,2) NOT NULL,
+  reason TEXT NOT NULL DEFAULT '',
+  status TEXT NOT NULL DEFAULT 'recalculating' CHECK (status IN ('recalculating','applied','superseded')),
+  created_by INTEGER NOT NULL REFERENCES users(id),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+);
 CREATE TABLE IF NOT EXISTS audit_logs (
   id SERIAL PRIMARY KEY,
   actor_id INTEGER REFERENCES users(id),
@@ -85,5 +97,11 @@ CREATE TABLE IF NOT EXISTS audit_logs (
   detail JSONB NOT NULL DEFAULT '{}'::jsonb,
   created_at TIMESTAMPTZ NOT NULL DEFAULT now()
 );
+ALTER TABLE quota_plans ADD COLUMN IF NOT EXISTS current_reduction_id INTEGER REFERENCES capacity_reductions(id);
+ALTER TABLE quota_plans ADD COLUMN IF NOT EXISTS applied_reduction_id INTEGER REFERENCES capacity_reductions(id);
+ALTER TABLE quota_plans ADD COLUMN IF NOT EXISTS reduction_seq INTEGER NOT NULL DEFAULT 0;
+ALTER TABLE quota_plans DROP CONSTRAINT IF EXISTS quota_plans_status_check;
+ALTER TABLE quota_plans ADD CONSTRAINT quota_plans_status_check CHECK (status IN ('queued','ready','split_required','approved','rejected','reduced_pending'));
 CREATE INDEX IF NOT EXISTS idx_quota_status ON quota_plans(status);
 CREATE INDEX IF NOT EXISTS idx_lot_status ON pulp_lots(status);
+CREATE INDEX IF NOT EXISTS idx_reduction_plan ON capacity_reductions(quota_plan_id);

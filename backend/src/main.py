@@ -1,10 +1,11 @@
+import json
 from datetime import date
 from fastapi import FastAPI, Depends, HTTPException
 from fastapi.middleware.cors import CORSMiddleware
 from pydantic import BaseModel, Field
 from .auth import current_user, issue_token, password_hash, require_roles
-from .db import query, execute
-from .services import audit, validate_blend, enqueue_quota, serialize_row
+from .db import query, execute, transaction
+from .services import audit, validate_blend, enqueue_quota, enqueue_recalc, serialize_row
 
 app = FastAPI(title="Pulp Output Quota API")
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
@@ -47,6 +48,9 @@ class IssueIn(BaseModel):
     quota_plan_id: int
     material_name: str
     quantity_tons: float
+class ReductionIn(BaseModel):
+    new_safety_limit_tons: float = Field(gt=0)
+    reason: str = Field(min_length=2, max_length=200)
 
 @app.get("/health")
 def health():
@@ -69,7 +73,7 @@ def summary(user=Depends(current_user)):
     row = query("""SELECT
       (SELECT count(*) FROM pulp_lots) AS lots,
       (SELECT count(*) FROM fiber_blends WHERE status='validated') AS blends,
-      (SELECT count(*) FROM quota_plans WHERE status IN ('queued','ready','split_required')) AS pending,
+      (SELECT count(*) FROM quota_plans WHERE status IN ('queued','ready','split_required','reduced_pending')) AS pending,
       (SELECT count(*) FROM material_issues WHERE status IN ('requested','approved')) AS issues""", one=True)
     recent = query("""SELECT q.plan_code,q.week_start,q.predicted_tons,q.upper_tons,q.status,l.lot_code,m.machine_name
       FROM quota_plans q JOIN pulp_lots l ON l.id=q.pulp_lot_id JOIN machine_runs m ON m.id=q.machine_run_id
@@ -128,10 +132,25 @@ def create_lot(payload: LotIn, user=Depends(require_roles("operator", "superviso
 @app.get("/quota-plans")
 def plans(user=Depends(current_user)):
     rows = query("""SELECT q.*,l.lot_code,l.grade,b.blend_code,b.virgin_pct,b.recycled_pct,b.broke_pct,
-      m.run_code,m.machine_name,m.safety_capacity_tons
+      m.run_code,m.machine_name,m.safety_capacity_tons,
+      r.reduction_code,r.reason AS reduction_reason,r.old_safety_limit_tons,r.new_safety_limit_tons,
+      r.status AS reduction_status,r.created_at AS reduced_at,
+      COALESCE((SELECT SUM(i.quantity_tons) FROM material_issues i
+        WHERE i.quota_plan_id=q.id AND i.status IN ('approved','issued')),0) AS approved_issue_tons,
+      COALESCE((SELECT SUM(i.quantity_tons) FROM material_issues i
+        WHERE i.quota_plan_id=q.id AND i.status IN ('requested','approved','issued')),0) AS occupied_tons
       FROM quota_plans q JOIN pulp_lots l ON l.id=q.pulp_lot_id JOIN fiber_blends b ON b.id=l.blend_id
-      JOIN machine_runs m ON m.id=q.machine_run_id ORDER BY q.created_at DESC""")
-    return [serialize_row(x) for x in rows]
+      JOIN machine_runs m ON m.id=q.machine_run_id
+      LEFT JOIN capacity_reductions r ON r.id=q.current_reduction_id
+      ORDER BY q.created_at DESC""")
+    result = []
+    for row in rows:
+        item = serialize_row(row)
+        planned = item.get("planned_tons")
+        item["remaining_tons"] = round(planned - item["occupied_tons"], 2) if planned is not None else None
+        item["recalc_done"] = bool(item.get("current_reduction_id")) and item.get("applied_reduction_id") == item.get("current_reduction_id")
+        result.append(item)
+    return result
 
 @app.post("/quota-plans/forecast")
 def create_forecast(payload: ForecastIn, user=Depends(require_roles("operator", "supervisor"))):
@@ -179,6 +198,62 @@ def approve_plan(plan_id: int, user=Depends(require_roles("supervisor"))):
     audit(user["id"], "quota_approved", "quota_plan", plan_id, {"planned_tons": float(row["planned_tons"])})
     return serialize_row(row)
 
+@app.post("/quota-plans/{plan_id}/reductions")
+def create_reduction(plan_id: int, payload: ReductionIn, user=Depends(require_roles("operator", "supervisor"))):
+    reduction = None
+    with transaction() as cur:
+        cur.execute("SELECT * FROM quota_plans WHERE id=%s FOR UPDATE", (plan_id,))
+        plan = cur.fetchone()
+        if not plan:
+            raise HTTPException(404, "配额提案不存在")
+        if plan["status"] not in ("approved", "reduced_pending"):
+            raise HTTPException(409, "只有已批准或待复批的配额才能录入降额")
+        old_limit = float(plan["safety_limit_tons"])
+        if payload.new_safety_limit_tons >= old_limit:
+            raise HTTPException(422, {"code": "REDUCTION_NOT_LOWER", "message": "新安全产能必须低于当前安全上限", "current_limit_tons": old_limit})
+        seq = int(plan["reduction_seq"]) + 1
+        code = f"QR-{plan['plan_code']}-{seq:02d}"
+        cur.execute("""INSERT INTO capacity_reductions(reduction_code,quota_plan_id,machine_run_id,old_safety_limit_tons,new_safety_limit_tons,reason,created_by)
+          VALUES (%s,%s,%s,%s,%s,%s,%s) RETURNING *""",
+          (code, plan_id, plan["machine_run_id"], old_limit, payload.new_safety_limit_tons, payload.reason, user["id"]))
+        reduction = dict(cur.fetchone())
+        # 原配额立即暂停领料：状态转为待复批，新工况随重算队列生效
+        cur.execute("""UPDATE quota_plans SET status='reduced_pending', safety_limit_tons=%s, current_reduction_id=%s,
+          reduction_seq=%s, notes=%s WHERE id=%s""",
+          (payload.new_safety_limit_tons, reduction["id"], seq, f"机台安全产能下调 {old_limit}→{payload.new_safety_limit_tons} t：{payload.reason}", plan_id))
+        cur.execute("INSERT INTO audit_logs(actor_id,action,entity,entity_id,detail) VALUES (%s,'capacity_reduced','quota_plan',%s,%s)",
+          (user["id"], plan_id, json.dumps({"reduction_code": code, "old_safety_limit_tons": old_limit, "new_safety_limit_tons": payload.new_safety_limit_tons, "reason": payload.reason})))
+    enqueue_recalc(reduction["id"])
+    return serialize_row(reduction)
+
+@app.get("/quota-plans/{plan_id}/reductions")
+def list_reductions(plan_id: int, user=Depends(current_user)):
+    rows = query("""SELECT r.*,u.display_name AS created_by_name FROM capacity_reductions r
+      LEFT JOIN users u ON u.id=r.created_by WHERE r.quota_plan_id=%s ORDER BY r.created_at DESC""", (plan_id,))
+    return [serialize_row(x) for x in rows]
+
+@app.post("/quota-plans/{plan_id}/reapprove")
+def reapprove_plan(plan_id: int, user=Depends(require_roles("supervisor"))):
+    with transaction() as cur:
+        cur.execute("SELECT * FROM quota_plans WHERE id=%s FOR UPDATE", (plan_id,))
+        plan = cur.fetchone()
+        if not plan:
+            raise HTTPException(404, "配额提案不存在")
+        if plan["status"] != "reduced_pending":
+            raise HTTPException(409, "当前配额不在降额待复批状态")
+        if not plan["current_reduction_id"] or plan["applied_reduction_id"] != plan["current_reduction_id"]:
+            raise HTTPException(409, "降额重算尚未完成，暂时不能复批")
+        cur.execute("SELECT COALESCE(SUM(quantity_tons),0) AS total FROM material_issues WHERE quota_plan_id=%s AND status IN ('approved','issued')", (plan_id,))
+        occupied = float(cur.fetchone()["total"])
+        planned = float(plan["planned_tons"])
+        if planned < occupied:
+            raise HTTPException(409, {"code": "REAPPROVE_SHORT_OF_APPROVED", "message": "新额度盖不住已批准领料吨位，主管不能复批", "planned_tons": planned, "approved_issue_tons": occupied, "shortage_tons": round(occupied - planned, 2)})
+        cur.execute("UPDATE quota_plans SET status='approved', approved_by=%s, approved_at=now() WHERE id=%s", (user["id"], plan_id))
+        cur.execute("INSERT INTO audit_logs(actor_id,action,entity,entity_id,detail) VALUES (%s,'quota_reapproved','quota_plan',%s,%s)",
+          (user["id"], plan_id, json.dumps({"planned_tons": planned, "approved_issue_tons": occupied, "reduction_id": plan["current_reduction_id"]})))
+    row = query("SELECT * FROM quota_plans WHERE id=%s", (plan_id,), one=True)
+    return serialize_row(row)
+
 @app.get("/material-issues")
 def issues(user=Depends(current_user)):
     rows = query("""SELECT i.*,q.plan_code,q.planned_tons,l.lot_code FROM material_issues i
@@ -187,26 +262,45 @@ def issues(user=Depends(current_user)):
 
 @app.post("/material-issues")
 def request_issue(payload: IssueIn, user=Depends(require_roles("operator", "supervisor"))):
-    plan = query("SELECT * FROM quota_plans WHERE id=%s", (payload.quota_plan_id,), one=True)
-    if not plan or plan["status"] != "approved":
-        raise HTTPException(422, "只有已批准配额才能创建领料计划")
-    used = query("SELECT COALESCE(SUM(quantity_tons),0) AS total FROM material_issues WHERE quota_plan_id=%s AND status IN ('requested','approved','issued')", (payload.quota_plan_id,), one=True)["total"]
-    if float(used) + payload.quantity_tons > float(plan["planned_tons"]):
-        raise HTTPException(422, {"code": "ISSUE_OVER_QUOTA", "message": "领料量超过已批准周配额", "remaining_tons": round(float(plan["planned_tons"]) - float(used), 2)})
-    try:
-        row = query("""INSERT INTO material_issues(issue_code,quota_plan_id,material_name,quantity_tons,requested_by)
-          VALUES (%s,%s,%s,%s,%s) RETURNING *""", (payload.issue_code,payload.quota_plan_id,payload.material_name,payload.quantity_tons,user['id']), one=True)
-    except Exception:
-        raise HTTPException(409, "领料请求编号已存在")
-    audit(user["id"], "material_issue_requested", "material_issue", row["id"], {"quantity_tons": payload.quantity_tons})
+    row = None
+    with transaction() as cur:
+        cur.execute("SELECT * FROM quota_plans WHERE id=%s FOR UPDATE", (payload.quota_plan_id,))
+        plan = cur.fetchone()
+        if not plan or plan["status"] != "approved":
+            raise HTTPException(422, "只有已批准配额才能创建领料计划")
+        cur.execute("SELECT COALESCE(SUM(quantity_tons),0) AS total FROM material_issues WHERE quota_plan_id=%s AND status IN ('requested','approved','issued')", (payload.quota_plan_id,))
+        used = cur.fetchone()["total"]
+        if float(used) + payload.quantity_tons > float(plan["planned_tons"]):
+            raise HTTPException(422, {"code": "ISSUE_OVER_QUOTA", "message": "领料量超过已批准周配额", "remaining_tons": round(float(plan["planned_tons"]) - float(used), 2)})
+        cur.execute("SELECT id FROM material_issues WHERE issue_code=%s", (payload.issue_code,))
+        if cur.fetchone():
+            raise HTTPException(409, "领料请求编号已存在")
+        cur.execute("""INSERT INTO material_issues(issue_code,quota_plan_id,material_name,quantity_tons,requested_by)
+          VALUES (%s,%s,%s,%s,%s) RETURNING *""", (payload.issue_code,payload.quota_plan_id,payload.material_name,payload.quantity_tons,user['id']))
+        row = dict(cur.fetchone())
+        cur.execute("INSERT INTO audit_logs(actor_id,action,entity,entity_id,detail) VALUES (%s,'material_issue_requested','material_issue',%s,%s)",
+          (user["id"], row["id"], json.dumps({"quantity_tons": payload.quantity_tons})))
     return serialize_row(row)
 
 @app.post("/material-issues/{issue_id}/approve")
 def approve_issue(issue_id: int, user=Depends(require_roles("supervisor"))):
-    row = query("UPDATE material_issues SET status='approved', approved_by=%s WHERE id=%s AND status='requested' RETURNING *", (user['id'], issue_id), one=True)
-    if not row:
-        raise HTTPException(409, "领料计划不存在或已处理")
-    audit(user["id"], "material_issue_approved", "material_issue", issue_id, {})
+    # 与降额并发时靠配额行锁定序：先批准的计入已占吨位，先降额的在这里看到 reduced_pending 后暂停审批
+    with transaction() as cur:
+        cur.execute("SELECT * FROM material_issues WHERE id=%s FOR UPDATE", (issue_id,))
+        issue = cur.fetchone()
+        if not issue or issue["status"] != "requested":
+            raise HTTPException(409, "领料计划不存在或已处理")
+        cur.execute("SELECT * FROM quota_plans WHERE id=%s FOR UPDATE", (issue["quota_plan_id"],))
+        plan = cur.fetchone()
+        if not plan or plan["status"] != "approved":
+            raise HTTPException(409, {"code": "ISSUE_APPROVAL_PAUSED", "message": "配额已降额待复批，领料审批暂停"})
+        cur.execute("SELECT COALESCE(SUM(quantity_tons),0) AS total FROM material_issues WHERE quota_plan_id=%s AND status IN ('approved','issued')", (plan["id"],))
+        occupied = float(cur.fetchone()["total"])
+        if occupied + float(issue["quantity_tons"]) > float(plan["planned_tons"]):
+            raise HTTPException(409, {"code": "ISSUE_OVER_QUOTA", "message": "批准后将超过配额剩余吨位", "remaining_tons": round(float(plan["planned_tons"]) - occupied, 2)})
+        cur.execute("UPDATE material_issues SET status='approved', approved_by=%s WHERE id=%s", (user['id'], issue_id))
+        cur.execute("INSERT INTO audit_logs(actor_id,action,entity,entity_id,detail) VALUES (%s,'material_issue_approved','material_issue',%s,'{}')", (user["id"], issue_id))
+    row = query("SELECT * FROM material_issues WHERE id=%s", (issue_id,), one=True)
     return serialize_row(row)
 
 @app.get("/audit-logs")

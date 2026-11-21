@@ -32,6 +32,9 @@ def validate_blend(values):
 def enqueue_quota(plan_id):
     redis_client.rpush("pulp:quota_jobs", str(plan_id))
 
+def enqueue_recalc(reduction_id):
+    redis_client.rpush("pulp:recalc_jobs", str(reduction_id))
+
 def decimal_json(value):
     if isinstance(value, Decimal):
         return float(value)
